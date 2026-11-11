@@ -1,0 +1,3 @@
+ALTER TABLE "locations" ADD COLUMN "is_primary" boolean DEFAULT false NOT NULL;--> statement-breakpoint
+CREATE UNIQUE INDEX "locations_one_primary_per_warehouse_uq" ON "locations" USING btree ("warehouse_id") WHERE "locations"."is_primary";--> statement-breakpoint
+ALTER TABLE "locations" ADD CONSTRAINT "locations_primary_is_internal" CHECK (NOT "locations"."is_primary" OR "locations"."kind" = 'internal');

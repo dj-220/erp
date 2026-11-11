@@ -1,0 +1,1 @@
+ALTER TABLE "payment_allocations" DROP CONSTRAINT "payment_allocations_payment_doc_uq";
