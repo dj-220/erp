@@ -213,6 +213,98 @@ Known limits of this milestone:
 - Financial year April-March; "today" taken in IST.
 - Display in lakh/crore grouping.
 
+## Built (milestone 6: login, API, dashboard, exports, web app)
+
+**Login and permissions** (`src/server/auth.ts`, `passwords.ts`, `team.ts`, `src/domain/permissions.ts`)
+- Passwords hashed with scrypt (parameters stored with the hash); at least 10 characters, not a
+  well-known password, not the email. A person given a temporary password must change it first.
+- Sessions last 12 hours; only a SHA-256 of the token is stored. The cookie is HttpOnly, SameSite=Lax
+  (`erp_session`, Secure behind HTTPS). Changing the password signs out every other session.
+- Five wrong passwords lock the account for 15 minutes. Login errors never say whether the email exists.
+  A per-address rate limiter sits in front of login and sign-up.
+- Roles: owner, admin, accountant, purchase, sales, stores, viewer. One table, `PERMISSIONS`, says which
+  role may do which action; the API checks it on every route, the web app hides what a role cannot do,
+  and the dashboard is filtered on the server so a role never receives figures it may not see.
+  Only an owner can add or remove an owner; the last owner cannot be removed or demoted. An owner or admin
+  can set a temporary password for a locked-out colleague (it ends their sessions and forces a change).
+
+**API** (`src/api`, Hono; `app.ts` = auth and safety, `routes.ts` = every business route)
+- Every feature is reachable over HTTP: company settings, team, parties, items, units, warehouses, BOMs;
+  stock balances, valuation, reorder suggestions, shortages, stock documents and counts; sales orders
+  (confirm, deliver, invoice, cancel, close), invoices and credit/debit notes; purchase requests (also from
+  shortages and from reorder levels), purchase orders (submit, send, receive), approvals (decide,
+  escalate); bills (submit, release, reject, post), payments (record, allocate, reverse); ageing reports,
+  audit trail, dashboard, exports.
+- The company and the person always come from the session, never from the request body. A client cannot
+  attach order-line ids to a stock document. Cross-company ids return "not found".
+- Writes must be JSON, within a size limit, and from an allowed origin (a CSRF guard on top of SameSite).
+  Security headers include a strict Content-Security-Policy. Errors are `{ error: { code, message } }`.
+- Lists are paged (`limit` up to 200, `offset`) and searchable where it makes sense.
+
+**Dashboard** (`src/server/dashboard.ts`): one call, worked out from the same queries the pages use.
+Order value at risk and the orders board; low stock (and stock value, for roles that may see money);
+purchase orders waiting for approval (with whether *this* person may decide); bills on hold; receivables
+and payables ageing with MSME breaches; this month and financial year to date; a six-month sales and
+purchases trend; recent activity.
+
+**Exports** (`src/server/exports.ts`, `src/domain/tally.ts`)
+- Excel (`exceljs`): eleven sheets (parties, items, stock, valuation, sales orders, sales invoices, purchase
+  orders, bills, payments, receivables, payables), money in rupees, real dates, a totals row, credit notes
+  shown as negatives. Choose sheets or take all.
+- Tally: two XML files, masters (ledgers, stock items) then vouchers (sales, credit and debit notes, purchase,
+  payment, receipt). Preview first. Exporting vouchers records each document in `export_batches` /
+  `exported_documents` (append-only), so a second export skips what was already sent; a payment reversed
+  after export is flagged to be reversed in Tally by hand.
+- **The XML has not been imported into a live TallyPrime.** Treat it as a draft mapping.
+
+**Web app** (`web/`, Vite + React; served by the API from `web/dist` so there is one address)
+- Sign in, create a company (when the server has sign-up on), change password, company switcher, light and dark
+  mode, works at phone width.
+- Dashboard (hero number, tiles, board, approvals, held bills, trend and ageing charts, each with a table
+  view and keyboard-reachable tooltips).
+- Lists: sales orders, invoices, purchase requests, purchase orders, stock movements, payments, customers
+  and suppliers, items, audit trail (search, filters, paging).
+- Actions: approve, reject or pass up an approval; submit, release, reject, post or cancel a bill;
+  create a purchase request from reorder levels; stock on hand, reorder and value; who owes what, by party;
+  Excel and Tally exports; people, roles, approval limits and company settings.
+- Data entry at every level, each with a draft stage where the rules allow it: customers and suppliers, items,
+  bills of materials; sales order (draft, confirm, partial delivery, invoice, post, credit and debit notes);
+  purchase request, purchase order (from a request or on its own; submit, send, receive part or all), supplier
+  bill (with the totals printed on the paper bill, matched and posted), payments and receipts applied to
+  documents or held on account, reversals; stock movements (receipt, delivery, transfer, adjustment) and
+  physical counts. Detail pages show lines, tax and what has been delivered, received and billed.
+- Not yet in the browser: editing or deactivating a customer, supplier or item after creation (the API has no
+  update route for them either), editing a draft document (cancel it and enter it again), and purchase returns.
+
+**Demo data**: `npm run demo` starts the app on `.data/demo`, filled the first time with a small apparel
+company (see `src/demo/seed.ts` for the people and the shared password). It has one late, one at-risk and
+one on-time order, held and matched bills, approvals waiting, and payments.
+
+## Built (milestone 7: the factory floor)
+
+**Plant layout** (`src/domain/plant.ts`, `src/server/plant.ts`, table `plant_areas`)
+- A company's floor is an ordered list of areas (work centres), stored as data: a store, the processes, quality
+  check, finished goods, dispatch, and scrap / rework. New companies get a standard ten-area layout; older
+  databases get it at start-up. Owners and admins add, rename, reorder and switch areas off.
+- Each area IS a stock location. The receiving store is the warehouse's primary location, so goods received
+  still land there. Nothing about an area holds a quantity: on-hand, work in progress and scrap are all worked
+  out from posted `stock_moves`.
+- Material moves between areas with an ordinary transfer document (`movePlantStock`): to the next stage by
+  default, backwards for rework, or to a scrap area for rejects. The direction and the source of the entry
+  (typed, spoken, scanned) are written to the audit entry. A move can be posted at once or left as a draft for
+  the receiving area to confirm; drafts show as "coming in" and "going out" and reduce what is free to move.
+- An area cannot be switched off while it holds stock or has a transfer waiting, and the receiving store cannot
+  be switched off. "Next stage" skips switched-off areas and never chooses scrap.
+- Permissions: `plant.read` (everyone), `plant.move` (owner, admin, stores, purchase), `plant.manage` (owner, admin).
+
+**Web**: *Inventory by area* shows the floor as a flow, then one tab per area in floor order with stock by item,
+what is waiting to be processed, transfers coming in and going out, recent movements and a "move to next stage"
+button. *Plant layout* is the settings page. Deliveries now ask which area to ship from (dispatch, then finished
+goods, by default).
+
+Limits: moving material does not change what the item is. Turning raw material into a finished item (consuming a
+bill of materials) is the production order in milestone 8.
+
 ## Next, in build order
 
 Each step is finished and tested before the next starts.
@@ -222,9 +314,10 @@ Each step is finished and tested before the next starts.
 2. ~~Sales~~ - built (milestone 3). Payments against invoices come with step 4.
 3. ~~Purchasing and approvals~~ - built (milestone 4).
 4. ~~Bills, 3-way match, payments~~ - built (milestone 5).
-5. **Dashboard and exports** - one dashboard from database queries (no separate copy of the data);
-   Excel export of every list plus a full workbook; Tally XML file for invoices, payments and
-   receipts. Sync status per document (not exported / exported) with the voucher id.
+5. ~~Dashboard, login, API and exports~~ - built (milestone 6).
+6. ~~Web forms~~ - built: every document can be entered from the browser.
+7. **Next**: edit and deactivate master data, edit drafts, import from Excel, print and PDF of invoices and
+   purchase orders.
 
 Document states (planned):
 - Sales order: draft -> confirmed -> (partly) delivered -> invoiced -> closed | cancelled
@@ -233,17 +326,19 @@ Document states (planned):
 
 ## Exports (version 1)
 
-- **Excel**: server-side workbook per module, filters applied, large exports as background jobs.
-- **Tally**: generate TallyPrime import XML from posted documents. Ledgers (parties, GST, round-off)
-  must exist in Tally first; company name must equal `companies.tally_company_name`; dates in Tally's
-  format. Download a file and import it in Tally. A connector that pushes automatically is a later
-  version. Test against a real Tally copy before trusting the mapping.
+Built; see milestone 6. Not yet done: running a large export as a background job, a connector that pushes
+to Tally by itself, and a check against a real Tally copy. Ledgers (parties, GST, round-off) must exist in
+Tally first and the company name must equal `companies.tally_company_name`.
 
 ## Known gaps and open questions
 
-- No authentication or API layer yet (users and memberships exist as data).
-- Roles are not yet checked when creating or submitting documents (a viewer could raise a purchase order);
-  only approval authority is enforced. Add role permissions with the API layer.
+- The Tally XML is untested against a real TallyPrime. Import into a test company first.
+- No "forgot password" email link: an owner or admin sets a temporary password (People and settings), which
+  the person must replace at next sign-in. That is refused for a login that also works in another company.
+  No two-factor sign-in.
+- Rate limiting is per process and in memory; run behind a proxy that limits too if more than one copy runs.
+- Master data cannot be edited or deactivated yet, in the browser or the API. A wrong customer or item is fixed
+  by creating the right one. Drafts cannot be edited, only cancelled and re-entered.
 - No row-level security yet; isolation currently rests on composite foreign keys plus every service
   scoping by `company_id`. Add Postgres RLS before multi-tenant production.
 - GST slabs (`GST_RATES_CURRENT`, `GST_RATES_LEGACY`) need confirming with a CA; rates change.

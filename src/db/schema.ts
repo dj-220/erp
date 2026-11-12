@@ -77,7 +77,8 @@ export const billStateEnum = pgEnum("bill_state", ["draft", "held", "matched", "
 export const paymentDirectionEnum = pgEnum("payment_direction", ["paid", "received"]);
 export const paymentModeEnum = pgEnum("payment_mode", ["bank", "cash", "upi", "cheque", "card", "other"]);
 export const paymentStateEnum = pgEnum("payment_state", ["posted", "reversed"]);
-export const stockDocTypeEnum = pgEnum("stock_doc_type", ["goods_receipt", "delivery", "transfer", "adjustment"]);
+export const stockDocTypeEnum = pgEnum("stock_doc_type", ["goods_receipt", "delivery", "transfer", "adjustment", "production"]);
+export const productionOrderStateEnum = pgEnum("production_order_state", ["draft", "released", "closed", "cancelled"]);
 export const stockStateEnum = pgEnum("stock_state", ["draft", "done", "cancelled"]);
 
 const GSTIN_SHAPE = sql`'^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$'`;
@@ -127,6 +128,14 @@ export const users = pgTable(
     name: text("name").notNull(),
     passwordHash: text("password_hash"),
     isActive: boolean("is_active").notNull().default(true),
+    /** Consecutive wrong passwords; reset by a successful login. */
+    failedLoginCount: smallint("failed_login_count").notNull().default(0),
+    /** After too many wrong passwords the account is locked until this time. */
+    lockedUntil: timestamp("locked_until", { withTimezone: true }),
+    lastLoginAt: timestamp("last_login_at", { withTimezone: true }),
+    /** Set when an administrator chose the password; the person should replace it. */
+    mustChangePassword: boolean("must_change_password").notNull().default(false),
+    passwordChangedAt: timestamp("password_changed_at", { withTimezone: true }),
     createdAt: createdAt(),
   },
   (t) => [
@@ -1045,6 +1054,55 @@ export const paymentAllocations = pgTable(
 /* ------------------------------------------------------------------ Inventory */
 
 /**
+ * A job to make a quantity of one item, usually for a sales order line. It holds the plan only
+ * (what, how many, for whom). How far it has got is never stored here: material issued, where the
+ * work in progress sits, what was scrapped and what is finished are all worked out from the stock
+ * moves that carry this order's id.
+ */
+export const productionOrders = pgTable(
+  "production_orders",
+  {
+    id: id(),
+    companyId: uuid("company_id")
+      .notNull()
+      .references(() => companies.id),
+    /** Given when the order is released to the floor. */
+    number: text("number"),
+    state: productionOrderStateEnum("state").notNull().default("draft"),
+    /** What is being made. */
+    itemId: uuid("item_id").notNull(),
+    /** The bill of materials used; fixed when the order is created. */
+    bomId: uuid("bom_id").notNull(),
+    qty: numeric("qty", { precision: 18, scale: 3 }).notNull(),
+    /** The customer order this is for, if any. */
+    salesOrderId: uuid("sales_order_id"),
+    salesOrderLineId: uuid("sales_order_line_id"),
+    orderDate: date("order_date", { mode: "string" }).notNull(),
+    dueDate: date("due_date", { mode: "string" }).notNull(),
+    notes: text("notes"),
+    createdBy: uuid("created_by").references(() => users.id),
+    releasedAt: timestamp("released_at", { withTimezone: true }),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    unique("production_orders_company_id_uq").on(t.companyId, t.id),
+    uniqueIndex("production_orders_number_uq").on(t.companyId, t.number).where(sql`${t.number} IS NOT NULL`),
+    index("production_orders_sales_line_idx").on(t.companyId, t.salesOrderLineId),
+    foreignKey({ name: "production_orders_item_fk", columns: [t.companyId, t.itemId], foreignColumns: [items.companyId, items.id] }),
+    foreignKey({ name: "production_orders_bom_fk", columns: [t.companyId, t.bomId], foreignColumns: [boms.companyId, boms.id] }),
+    foreignKey({ name: "production_orders_sales_order_fk", columns: [t.companyId, t.salesOrderId], foreignColumns: [salesOrders.companyId, salesOrders.id] }),
+    foreignKey({
+      name: "production_orders_sales_line_fk",
+      columns: [t.companyId, t.salesOrderLineId],
+      foreignColumns: [salesOrderLines.companyId, salesOrderLines.id],
+    }),
+    check("production_orders_qty_positive", sql`${t.qty} > 0`),
+    check("production_orders_number_when_released", sql`(${t.state} = 'draft') OR (${t.state} = 'cancelled') OR (${t.number} IS NOT NULL)`),
+    check("production_orders_line_needs_order", sql`${t.salesOrderLineId} IS NULL OR ${t.salesOrderId} IS NOT NULL`),
+  ],
+);
+
+/**
  * A stock document groups stock moves: goods receipt, delivery, transfer or adjustment.
  * It gets its number only when posted, so cancelled drafts never leave gaps in the series.
  * Once done or cancelled it can never change (trigger); corrections are new documents.
@@ -1122,6 +1180,8 @@ export const stockMoves = pgTable(
     salesOrderLineId: uuid("sales_order_line_id"),
     /** The purchase order line this receipt serves; how "received so far" is worked out. */
     purchaseOrderLineId: uuid("purchase_order_line_id"),
+    /** The production order this material belongs to; how an order's progress through the floor is worked out. */
+    productionOrderId: uuid("production_order_id"),
     state: stockStateEnum("state").notNull().default("draft"),
     createdAt: createdAt(),
   },
@@ -1130,6 +1190,12 @@ export const stockMoves = pgTable(
     index("stock_moves_item_idx").on(t.companyId, t.itemId, t.state),
     index("stock_moves_order_line_idx").on(t.companyId, t.salesOrderLineId),
     index("stock_moves_po_line_idx").on(t.companyId, t.purchaseOrderLineId),
+    index("stock_moves_production_order_idx").on(t.companyId, t.productionOrderId),
+    foreignKey({
+      name: "stock_moves_production_order_fk",
+      columns: [t.companyId, t.productionOrderId],
+      foreignColumns: [productionOrders.companyId, productionOrders.id],
+    }),
     foreignKey({
       name: "stock_moves_purchase_order_line_fk",
       columns: [t.companyId, t.purchaseOrderLineId],
@@ -1165,5 +1231,116 @@ export const stockMoves = pgTable(
     check("stock_moves_value_iff_done", sql`(${t.state} = 'done') = (${t.valuePaise} IS NOT NULL)`),
     check("stock_moves_value_nonneg", sql`${t.valuePaise} IS NULL OR ${t.valuePaise} >= 0`),
     check("stock_moves_cost_nonneg", sql`${t.unitCost} IS NULL OR ${t.unitCost} >= 0`),
+  ],
+);
+
+/* ------------------------------------------------------------------ Sessions and exports */
+
+/**
+ * A login. The browser holds a random token; only its SHA-256 is stored, so a leaked database
+ * cannot be used to impersonate anyone. A session ends at `expires_at` or when revoked.
+ */
+export const sessions = pgTable(
+  "sessions",
+  {
+    id: id(),
+    userId: uuid("user_id")
+      .notNull()
+      .references(() => users.id),
+    tokenHash: text("token_hash").notNull(),
+    /** The company the person is working in. */
+    activeCompanyId: uuid("active_company_id").references(() => companies.id),
+    userAgent: text("user_agent"),
+    createdAt: createdAt(),
+    lastSeenAt: timestamp("last_seen_at", { withTimezone: true }).notNull().defaultNow(),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+  },
+  (t) => [uniqueIndex("sessions_token_hash_uq").on(t.tokenHash), index("sessions_user_idx").on(t.userId)],
+);
+
+/** One file handed to the accountant for import into Tally. Append-only. */
+export const exportBatches = pgTable(
+  "export_batches",
+  {
+    id: id(),
+    companyId: uuid("company_id")
+      .notNull()
+      .references(() => companies.id),
+    kind: text("kind").notNull(),
+    dateFrom: date("date_from", { mode: "string" }).notNull(),
+    dateTo: date("date_to", { mode: "string" }).notNull(),
+    voucherCount: integer("voucher_count").notNull(),
+    fileSha256: text("file_sha256").notNull(),
+    createdBy: uuid("created_by")
+      .notNull()
+      .references(() => users.id),
+    createdAt: createdAt(),
+  },
+  (t) => [unique("export_batches_company_id_uq").on(t.companyId, t.id), check("export_batches_kind", sql`${t.kind} IN ('tally')`)],
+);
+
+/**
+ * Which documents went into which batch. A document is exported once; this is how "not yet sent to
+ * Tally" is known without touching the posted (immutable) document itself. Append-only.
+ */
+export const exportedDocuments = pgTable(
+  "exported_documents",
+  {
+    id: id(),
+    companyId: uuid("company_id")
+      .notNull()
+      .references(() => companies.id),
+    batchId: uuid("batch_id").notNull(),
+    docType: text("doc_type").notNull(),
+    docId: uuid("doc_id").notNull(),
+    voucherNumber: text("voucher_number").notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    unique("exported_documents_doc_uq").on(t.companyId, t.docType, t.docId),
+    foreignKey({
+      name: "exported_documents_batch_fk",
+      columns: [t.companyId, t.batchId],
+      foreignColumns: [exportBatches.companyId, exportBatches.id],
+    }),
+    check("exported_documents_doc_type", sql`${t.docType} IN ('sales_invoice', 'purchase_bill', 'payment')`),
+  ],
+);
+
+export const plantAreaKindEnum = pgEnum("plant_area_kind", ["store", "process", "qc", "finished", "dispatch", "scrap"]);
+
+/**
+ * The factory floor as an ordered list of areas (work centres): stores, each process, quality
+ * check, finished goods, dispatch, scrap. Each area IS a stock location, so what sits in an area
+ * is worked out from stock moves like any other stock; nothing here holds a quantity.
+ */
+export const plantAreas = pgTable(
+  "plant_areas",
+  {
+    id: id(),
+    companyId: uuid("company_id")
+      .notNull()
+      .references(() => companies.id),
+    /** The stock location that holds this area's material. One area per location. */
+    locationId: uuid("location_id").notNull(),
+    name: text("name").notNull(),
+    kind: plantAreaKindEnum("kind").notNull(),
+    /** Position along the floor: material normally flows from lower to higher. */
+    sortOrder: integer("sort_order").notNull(),
+    isActive: boolean("is_active").notNull().default(true),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    unique("plant_areas_company_id_uq").on(t.companyId, t.id),
+    unique("plant_areas_location_uq").on(t.companyId, t.locationId),
+    unique("plant_areas_name_uq").on(t.companyId, t.name),
+    index("plant_areas_order_idx").on(t.companyId, t.sortOrder),
+    foreignKey({
+      name: "plant_areas_location_fk",
+      columns: [t.companyId, t.locationId],
+      foreignColumns: [locations.companyId, locations.id],
+    }),
+    check("plant_areas_name_not_blank", sql`length(trim(${t.name})) > 0`),
   ],
 );

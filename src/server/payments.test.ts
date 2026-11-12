@@ -283,6 +283,16 @@ describe("receiving money from customers", () => {
     expect((await getReceivablesAgeing(db, { companyId: s.c, asOf: "2025-07-20" })).totalOutstandingPaise).toBe(118_000);
     expect((await getPayment(db, { companyId: s.c, paymentId: paid.id })).state).toBe("reversed");
   });
+
+  it("says which invoice each part of a receipt went to", async () => {
+    const s = await sellingWorld("Receipts Six");
+    const invoice = await s.invoiceFor(1, "2025-06-05");
+    const paid = await receive(s, "1180", [{ docId: invoice.id, amount: "1000" }]);
+    const detail = await getPayment(db, { companyId: s.c, paymentId: paid.id });
+    expect(detail.allocations).toHaveLength(1);
+    expect(detail.allocations[0]).toMatchObject({ docId: invoice.id, amountPaise: 100_000, docNumber: invoice.number });
+    expect(detail.unallocatedPaise).toBe(18_000);
+  });
 });
 
 describe("payables ageing", () => {

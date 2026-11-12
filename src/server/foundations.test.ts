@@ -39,9 +39,10 @@ describe("createCompany", () => {
     expect(await db.select().from(uoms).where(eq(uoms.companyId, company.id))).toHaveLength(22);
     expect(await db.select().from(warehouses).where(eq(warehouses.companyId, company.id))).toHaveLength(1);
     const locs = await db.select().from(locations).where(eq(locations.companyId, company.id));
-    expect(locs.map((l) => l.kind).sort()).toEqual(
-      ["adjustment", "customer", "internal", "production", "supplier", "transit"],
-    );
+    // One stock location for each of the ten default plant areas, plus the five virtual ones
+    expect([...new Set(locs.map((l) => l.kind))].sort()).toEqual(["adjustment", "customer", "internal", "production", "supplier", "transit"]);
+    expect(locs.filter((l) => l.kind === "internal")).toHaveLength(10);
+    expect(locs.filter((l) => l.isPrimary).map((l) => l.name)).toEqual(["Main / Stock"]);
     expect(locs.filter((l) => l.warehouseId === null)).toHaveLength(5);
 
     const log = await db.select().from(auditLog).where(eq(auditLog.companyId, company.id));

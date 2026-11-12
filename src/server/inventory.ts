@@ -13,7 +13,7 @@ import { allocateDocNumber } from "./numbering";
 import { balanceAt, onHandByItem } from "./stock-queries";
 import { one } from "./util";
 
-type StockDocType = "goods_receipt" | "delivery" | "transfer" | "adjustment";
+type StockDocType = "goods_receipt" | "delivery" | "transfer" | "adjustment" | "production";
 type Location = typeof locations.$inferSelect;
 
 const NUMBER_TYPE: Record<StockDocType, DocType> = {
@@ -21,6 +21,7 @@ const NUMBER_TYPE: Record<StockDocType, DocType> = {
   delivery: "delivery",
   transfer: "stock_transfer",
   adjustment: "stock_adjustment",
+  production: "production",
 };
 
 const decimal = z.union([z.string(), z.number()]).transform((v) => v.toString());
@@ -34,8 +35,10 @@ const LineInput = z.object({
   /** Location names. Defaults depend on the document type; see `routeLine`. */
   fromLocation: z.string().trim().min(1).optional(),
   toLocation: z.string().trim().min(1).optional(),
-  /** Adjustments only. */
+  /** Adjustments, and production (decrease = material used up, increase = the item made). */
   direction: z.enum(["increase", "decrease"]).optional(),
+  /** The production order this material belongs to. Set by the production and floor services, never by a client. */
+  productionOrderId: z.uuid().optional(),
   /** Deliveries only: the sales order line this serves. */
   salesOrderLineId: z.uuid().optional(),
   /** Goods receipts only: the purchase order line this serves. */
@@ -45,7 +48,7 @@ const LineInput = z.object({
 export const CreateStockDocumentInput = z.object({
   companyId: z.uuid(),
   actorUserId: z.uuid().optional(),
-  docType: z.enum(["goods_receipt", "delivery", "transfer", "adjustment"]),
+  docType: z.enum(["goods_receipt", "delivery", "transfer", "adjustment", "production"]),
   docDate: dateString,
   /** Supplier for a receipt, customer for a delivery. */
   partyId: z.uuid().optional(),
@@ -68,6 +71,7 @@ interface Context {
   supplier: Location;
   customer: Location;
   adjustment: Location;
+  production: Location;
 }
 
 async function loadContext(
@@ -106,6 +110,7 @@ async function loadContext(
     supplier: firstOfKind("supplier"),
     customer: firstOfKind("customer"),
     adjustment: firstOfKind("adjustment"),
+    production: firstOfKind("production"),
   };
 }
 
@@ -138,6 +143,13 @@ function routeLine(docType: StockDocType, line: z.infer<typeof LineInput>, ctx: 
       const place = internal(line.toLocation ?? line.fromLocation, ctx.defaultInternal);
       return line.direction === "increase" ? { from: ctx.adjustment, to: place } : { from: place, to: ctx.adjustment };
     }
+    case "production": {
+      // Material is used up into the virtual "Production" location, and the item made comes out of it.
+      if (!line.direction) throw new DomainError("DIRECTION_REQUIRED", `Say whether ${line.sku} is used up or made`);
+      return line.direction === "increase"
+        ? { from: ctx.production, to: internal(line.toLocation, ctx.defaultInternal) }
+        : { from: internal(line.fromLocation, ctx.defaultInternal), to: ctx.production };
+    }
   }
 }
 
@@ -160,6 +172,12 @@ export async function createStockDocument(db: Transactor, rawInput: CreateStockD
       }
     }
 
+    if (input.docType === "production") {
+      const made = input.lines.filter((l) => l.direction === "increase");
+      if (made.length !== 1 || input.lines.at(-1)?.direction !== "increase" || input.lines.length < 2) {
+        throw new DomainError("INVALID_PRODUCTION", "A production entry lists the material used, then the one item made");
+      }
+    }
     const prepared = input.lines.map((line, index) => {
       const item = ctx.itemBySku.get(line.sku);
       if (!item) throw new DomainError("UNKNOWN_ITEM", `Item "${line.sku}" does not exist`);
@@ -171,6 +189,7 @@ export async function createStockDocument(db: Transactor, rawInput: CreateStockD
       const qty = assertQty(line.qty, item.decimals, `Quantity for ${line.sku}`);
       const { from, to } = routeLine(input.docType, line, ctx);
 
+      // What is made is valued at the material used, worked out when the entry is posted; it never takes a typed cost.
       const takesCost = input.docType === "goods_receipt" || (input.docType === "adjustment" && line.direction === "increase");
       if (line.unitCost !== undefined && !takesCost) {
         throw new DomainError("COST_NOT_ALLOWED", `${line.sku}: stock leaving or moving is valued automatically; remove the unit cost`);
@@ -191,6 +210,7 @@ export async function createStockDocument(db: Transactor, rawInput: CreateStockD
         unitCost: line.unitCost ?? null,
         salesOrderLineId: line.salesOrderLineId ?? null,
         purchaseOrderLineId: line.purchaseOrderLineId ?? null,
+        productionOrderId: line.productionOrderId ?? null,
       };
     });
 
@@ -269,6 +289,8 @@ export async function postStockDocument(
     );
 
     let totalValue = 0;
+    // For a production entry: the value of the material used so far, which the item made takes on exactly.
+    let usedValue = 0;
     for (const move of moves) {
       const item = itemById.get(move.itemId) as typeof items.$inferSelect;
       const from = locById.get(move.fromLocationId) as Location;
@@ -292,7 +314,9 @@ export async function postStockDocument(
 
       const onHand = (await onHandByItem(tx, args.companyId, [item.id])).get(item.id) ?? { qty: new Big(0), valuePaise: 0 };
       let value: number;
-      if (!leavesStock) {
+      if (doc.docType === "production" && !leavesStock) {
+        value = usedValue;
+      } else if (!leavesStock) {
         // Stock coming in from outside: the stated cost, else the current average, else the item's purchase price.
         const rate = move.unitCost ?? averageCost(onHand.qty, onHand.valuePaise) ?? item.purchasePrice;
         if (rate === null) {
@@ -308,7 +332,10 @@ export async function postStockDocument(
         });
       }
       await tx.update(stockMoves).set({ state: "done", valuePaise: value }).where(eq(stockMoves.id, move.id));
-      if (!leavesStock || !entersStock) totalValue += value;
+      if (doc.docType === "production") {
+        // Material turns into the item made: stock value moves from one to the other and the total does not change.
+        if (leavesStock) usedValue += value;
+      } else if (!leavesStock || !entersStock) totalValue += value;
     }
 
     const number = await allocateDocNumber(tx, {

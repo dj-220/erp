@@ -1,0 +1,4 @@
+# Keep line endings the same on every machine (the repo is LF; Windows checkouts stay LF).
+* text=auto eol=lf
+*.png binary
+*.xlsx binary

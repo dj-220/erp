@@ -21,6 +21,8 @@ export const DOC_TYPES = {
   payment: { prefix: "PAY", gst: false },
   receipt: { prefix: "RCT", gst: false },
   stock_adjustment: { prefix: "ADJ", gst: false },
+  production_order: { prefix: "MO", gst: false },
+  production: { prefix: "MFG", gst: false },
 } as const;
 
 export type DocType = keyof typeof DOC_TYPES;

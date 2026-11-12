@@ -85,6 +85,41 @@
       "when": 1794395999719,
       "tag": "0011_allow_topping_up_allocations",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1794398659488,
+      "tag": "0012_login_and_exports",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1794398663370,
+      "tag": "0013_exports_append_only",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1794410546113,
+      "tag": "0014_amazing_retro_girl",
+      "breakpoints": true
+    },
+    {
+      "idx": 15,
+      "version": "7",
+      "when": 1794411655061,
+      "tag": "0015_striped_dakota_north",
+      "breakpoints": true
+    },
+    {
+      "idx": 16,
+      "version": "7",
+      "when": 1794411660782,
+      "tag": "0016_production_orders_guard",
+      "breakpoints": true
     }
   ]
 }

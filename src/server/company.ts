@@ -1,12 +1,13 @@
 import { eq } from "drizzle-orm";
 import { z } from "zod";
 import { DEFAULT_UOMS, VIRTUAL_LOCATIONS } from "../db/defaults";
-import type { Db } from "../db/client";
+import type { Transactor } from "../db/client";
 import { companies, locations, memberships, uoms, users, warehouses } from "../db/schema";
 import { DomainError } from "../domain/errors";
 import { parseGstin } from "../domain/gstin";
 import { requireState } from "../domain/states";
 import { recordAudit } from "./audit";
+import { seedDefaultPlantAreas } from "./plant";
 import { one } from "./util";
 
 export const CreateCompanyInput = z.object({
@@ -27,10 +28,10 @@ export const CreateCompanyInput = z.object({
 export type CreateCompanyInput = z.input<typeof CreateCompanyInput>;
 
 /**
- * Create a company with its owner, the standard units of measure, a main warehouse and the
- * virtual locations stock moves need. All or nothing.
+ * Create a company with its owner, the standard units of measure, a main warehouse, the virtual
+ * locations stock moves need, and the standard factory floor (plant areas). All or nothing.
  */
-export async function createCompany(db: Db, rawInput: CreateCompanyInput) {
+export async function createCompany(db: Transactor, rawInput: CreateCompanyInput) {
   const input = CreateCompanyInput.parse(rawInput);
 
   let stateCode = input.stateCode;
@@ -87,16 +88,22 @@ export async function createCompany(db: Db, rawInput: CreateCompanyInput) {
         .returning(),
       "warehouse",
     );
-    await tx.insert(locations).values([
-      {
-        companyId: company.id,
-        warehouseId: warehouse.id,
-        name: "Main / Stock",
-        kind: "internal" as const,
-        isPrimary: true,
-      },
-      ...VIRTUAL_LOCATIONS.map((l) => ({ companyId: company.id, warehouseId: null, ...l })),
-    ]);
+    const created = await tx
+      .insert(locations)
+      .values([
+        {
+          companyId: company.id,
+          warehouseId: warehouse.id,
+          name: "Main / Stock",
+          kind: "internal" as const,
+          isPrimary: true,
+        },
+        ...VIRTUAL_LOCATIONS.map((l) => ({ companyId: company.id, warehouseId: null, ...l })),
+      ])
+      .returning();
+    // The factory floor: the main stock location is the raw material store, the rest are new areas.
+    const primary = one(created.filter((l) => l.isPrimary), "primary location");
+    await seedDefaultPlantAreas(tx, { companyId: company.id, warehouseId: warehouse.id, primaryLocationId: primary.id });
 
     await recordAudit(tx, {
       companyId: company.id,

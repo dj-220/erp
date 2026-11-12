@@ -273,9 +273,20 @@ export async function getPayment(db: Executor, args: { companyId: string; paymen
     .where(and(eq(paymentAllocations.companyId, args.companyId), eq(paymentAllocations.paymentId, payment.id)))
     .orderBy(asc(paymentAllocations.createdAt), asc(paymentAllocations.id));
   const allocated = allocations.reduce((s, a) => s + a.amountPaise, 0);
+  // Say which bill or invoice each part went to, so a person does not have to read ids.
+  const labels = new Map<string, string>();
+  if (allocations.length > 0) {
+    const ids = sql.join(allocations.map((a) => sql`${a.docId}`), sql`, `);
+    const { rows } = await db.execute(
+      payment.direction === "paid"
+        ? sql`SELECT id, coalesce(number, supplier_bill_no) AS label FROM purchase_bills WHERE company_id = ${args.companyId} AND id IN (${ids})`
+        : sql`SELECT id, number AS label FROM sales_invoices WHERE company_id = ${args.companyId} AND id IN (${ids})`,
+    );
+    for (const r of rows as { id: string; label: string | null }[]) labels.set(r.id, r.label ?? "");
+  }
   return {
     ...payment,
-    allocations,
+    allocations: allocations.map((a) => ({ ...a, docNumber: labels.get(a.docId) ?? null })),
     allocatedPaise: allocated,
     unallocatedPaise: payment.state === "posted" ? payment.amountPaise - allocated : 0,
   };
